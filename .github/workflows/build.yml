@@ -1,4 +1,4 @@
-name: Build multi-arch Docker image
+name: Build multi-arch Docker image for Tika
 
 on:
   workflow_dispatch:
