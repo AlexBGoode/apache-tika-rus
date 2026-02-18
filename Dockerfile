@@ -1,5 +1,10 @@
 FROM apache/tika:3.2.3.0-full
+
 USER root
-COPY Dockerfile .
-RUN apt-get update && apt-get install -y tesseract-ocr-rus tesseract-ocr-eng
-USER "35002:35002"
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      tesseract-ocr-rus \
+      tesseract-ocr-eng \
+ && rm -rf /var/lib/apt/lists/*
+
+USER 35002:35002
