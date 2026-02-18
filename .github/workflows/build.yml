@@ -17,6 +17,7 @@ jobs:
     env:
       IMAGE_NAME: ghcr.io/alexbgoode/apache-tika
       IMAGE_TAG: rus
+      TEST_IMAGE_TAG: local-ocr-test
       PLATFORMS: linux/amd64,linux/arm64
 
     steps:
@@ -42,7 +43,180 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push multi-arch image
-        # go building always 
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE_NAME }}:${{ env.TEST_IMAGE_TAG }}
+          load: true
+          cache-from: type=gha
+
+      - name: OCR smoke test against just-built image
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import zlib
+
+          text = "TEST OCR"
+          width = 220
+          height = 70
+
+          glyphs = {
+              "T": [
+                  "11111",
+                  "00100",
+                  "00100",
+                  "00100",
+                  "00100",
+                  "00100",
+                  "00100",
+              ],
+              "E": [
+                  "11111",
+                  "10000",
+                  "10000",
+                  "11110",
+                  "10000",
+                  "10000",
+                  "11111",
+              ],
+              "S": [
+                  "01111",
+                  "10000",
+                  "10000",
+                  "01110",
+                  "00001",
+                  "00001",
+                  "11110",
+              ],
+              "O": [
+                  "01110",
+                  "10001",
+                  "10001",
+                  "10001",
+                  "10001",
+                  "10001",
+                  "01110",
+              ],
+              "C": [
+                  "01111",
+                  "10000",
+                  "10000",
+                  "10000",
+                  "10000",
+                  "10000",
+                  "01111",
+              ],
+              "R": [
+                  "11110",
+                  "10001",
+                  "10001",
+                  "11110",
+                  "10100",
+                  "10010",
+                  "10001",
+              ],
+              " ": [
+                  "000",
+                  "000",
+                  "000",
+                  "000",
+                  "000",
+                  "000",
+                  "000",
+              ],
+          }
+
+          scale = 5
+          canvas = [[255 for _ in range(width)] for _ in range(height)]
+          cursor_x = 20
+          cursor_y = 15
+
+          for ch in text:
+              glyph = glyphs[ch]
+              gw = len(glyph[0])
+              for y, row in enumerate(glyph):
+                  for x, bit in enumerate(row):
+                      if bit == "1":
+                          for sy in range(scale):
+                              for sx in range(scale):
+                                  px = cursor_x + x * scale + sx
+                                  py = cursor_y + y * scale + sy
+                                  if 0 <= px < width and 0 <= py < height:
+                                      canvas[py][px] = 0
+              cursor_x += (gw + 2) * scale
+
+          raw = b"".join(bytes(row) for row in canvas)
+          compressed = zlib.compress(raw)
+
+          objects = []
+          objects.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+          objects.append(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+
+          page = (
+              b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+              b"/Resources << /XObject << /Im0 4 0 R >> >> "
+              b"/Contents 5 0 R >>"
+          )
+          objects.append(page)
+
+          image_dict = (
+              f"<< /Type /XObject /Subtype /Image /Width {width} /Height {height} "
+              f"/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode "
+              f"/Length {len(compressed)} >>\n".encode("ascii")
+          )
+          image_stream = image_dict + b"stream\n" + compressed + b"\nendstream"
+          objects.append(image_stream)
+
+          content = b"q\n300 0 0 95 156 360 cm\n/Im0 Do\nQ\n"
+          content_dict = f"<< /Length {len(content)} >>\n".encode("ascii")
+          content_stream = content_dict + b"stream\n" + content + b"endstream"
+          objects.append(content_stream)
+
+          pdf = bytearray(b"%PDF-1.4\n")
+          offsets = [0]
+          for i, obj in enumerate(objects, start=1):
+              offsets.append(len(pdf))
+              pdf.extend(f"{i} 0 obj\n".encode("ascii"))
+              pdf.extend(obj)
+              pdf.extend(b"\nendobj\n")
+
+          xref_offset = len(pdf)
+          pdf.extend(f"xref\n0 {len(objects)+1}\n".encode("ascii"))
+          pdf.extend(b"0000000000 65535 f \n")
+          for off in offsets[1:]:
+              pdf.extend(f"{off:010d} 00000 n \n".encode("ascii"))
+          pdf.extend(
+              f"trailer\n<< /Size {len(objects)+1} /Root 1 0 R >>\n"
+              f"startxref\n{xref_offset}\n%%EOF\n".encode("ascii")
+          )
+
+          Path("/tmp/ocr-smoke.pdf").write_bytes(pdf)
+          PY
+
+          docker run -d --rm --name tika-ocr-smoke -p 9998:9998 ${{ env.IMAGE_NAME }}:${{ env.TEST_IMAGE_TAG }}
+          trap 'docker rm -f tika-ocr-smoke >/dev/null 2>&1 || true' EXIT
+
+          for i in {1..60}; do
+            if curl -sf http://localhost:9998/ >/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+
+          curl -sS -T /tmp/ocr-smoke.pdf -H 'Accept: text/plain' http://localhost:9998/tika > /tmp/ocr-output.txt
+          cat /tmp/ocr-output.txt
+
+          NORMALIZED_OUTPUT="$(tr -cd '[:alnum:]' </tmp/ocr-output.txt | tr '[:lower:]' '[:upper:]')"
+          if [[ "${NORMALIZED_OUTPUT}" != *"TESTOCR"* ]]; then
+            echo "Expected OCR output to contain TEST OCR, got: ${NORMALIZED_OUTPUT}" >&2
+            exit 1
+          fi
+
+      - name: Build and push multi-arch image
+        # go building always
         uses: docker/build-push-action@v5
         with:
           context: .
